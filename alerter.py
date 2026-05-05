@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 import requests
@@ -20,17 +20,24 @@ class Alert:
     dst: str
     detail: str
     timestamp: datetime
+    severity: str = field(default="MEDIUM")  # INFO | MEDIUM | HIGH | CRITICAL
 
     def format_message(self) -> str:
         return (
-            f"[NETMON] {self.rule} | proc: {self.proc_name}({self.pid})"
-            f" | {self.src}\u2192{self.dst} | {self.detail}"
+            f"[VIGIL] {self.severity} | {self.rule} | proc: {self.proc_name}({self.pid})"
+            f" | {self.src}→{self.dst} | {self.detail}"
         )
+
+
+_SEVERITY_RANK = {"INFO": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
 
 
 def dispatch(alert: Alert, cfg: Config, log: logging.Logger) -> None:
     msg = alert.format_message()
     log.warning(msg)
+    min_sev = getattr(cfg, "alert_min_severity", "MEDIUM")
+    if _SEVERITY_RANK.get(alert.severity, 0) < _SEVERITY_RANK.get(min_sev, 0):
+        return
     if cfg.discord_webhook_url:
         _send_discord(alert, cfg.discord_webhook_url, log)
     if cfg.toast_enabled:
@@ -51,8 +58,8 @@ def _send_discord(alert: Alert, webhook_url: str, log: logging.Logger) -> None:
 
 
 def _send_toast(alert: Alert, log: logging.Logger) -> None:
-    title = f"[NETMON] {alert.rule}"
-    msg = f"{alert.proc_name}({alert.pid}) {alert.src}\u2192{alert.dst}\n{alert.detail}"
+    title = f"[VIGIL] {alert.severity} | {alert.rule}"
+    msg = f"{alert.proc_name}({alert.pid}) {alert.src}→{alert.dst}\n{alert.detail}"
     try:
         if sys.platform == "win32":
             _toast_windows(title, msg, log)
@@ -69,7 +76,7 @@ def _toast_windows(title: str, msg: str, log: logging.Logger) -> None:
         from winotify import Notification, audio  # type: ignore[import]
 
         toast = Notification(
-            app_id="NetMon",
+            app_id="vigil",
             title=title,
             msg=msg,
             duration="short",

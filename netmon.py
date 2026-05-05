@@ -9,12 +9,15 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Any
 
 import psutil
 
 from alerter import dispatch
 from baseline import Baseline, load_baseline, record_poll, save_baseline
 from config import PRIVATE_PREFIXES, Config, load_config
+from defender import defend
+from dns_cache import DomainCache
 from rules import (
     ConnRecord,
     ExitRecord,
@@ -22,6 +25,9 @@ from rules import (
     check_new_process_egress,
     check_parallel_exfil,
     check_short_lived_egress,
+    check_oauth_provider_contact,
+    check_oauth_provider_chain,
+    check_mcp_connector_traffic,
     check_baseline_unknown_process,
     check_baseline_ip_deviation,
     check_baseline_port_deviation,
@@ -44,10 +50,36 @@ class DaemonState:
     baseline_proc_alerted: set = field(default_factory=set)   # set[str] proc_name
     baseline_ip_alerted: set = field(default_factory=set)     # set[tuple[str,str]]
     baseline_port_alerted: set = field(default_factory=set)   # set[tuple[str,int]]
+    # OAuth / MCP chain state
+    oauth_contact_alerted: set = field(default_factory=set)   # set[tuple[int, str]]
+    oauth_chain_alerted: set = field(default_factory=set)     # set[int]
+    oauth_chain_state: dict = field(default_factory=dict)     # dict[int, list[tuple[str, datetime]]]
+    mcp_traffic_alerted: set = field(default_factory=set)     # set[tuple[int, str]]
+
+
+def evict_pid(pid: int, *collections: Any) -> None:
+    """Remove all entries for a PID from alerted sets and chain state dicts.
+
+    Accepts any number of sets (int-keyed or tuple[int, ...]-keyed) and dicts
+    (int-keyed). Safe to call when the PID is not present in a collection.
+
+    Windows reuses PIDs aggressively. Without eviction, a new process at a
+    recycled PID would be silently suppressed for rules that already fired on
+    the previous occupant of that PID.
+    """
+    for coll in collections:
+        if isinstance(coll, dict):
+            coll.pop(pid, None)
+        elif isinstance(coll, set):
+            # Remove int entries directly.
+            coll.discard(pid)
+            # Remove tuple entries whose first element is this pid.
+            to_remove = {e for e in coll if isinstance(e, tuple) and e[0] == pid}
+            coll -= to_remove
 
 
 def build_logger(cfg: Config) -> logging.Logger:
-    log = logging.getLogger("netmon")
+    log = logging.getLogger("vigil")
     log.setLevel(logging.DEBUG)
 
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
@@ -70,7 +102,7 @@ def build_logger(cfg: Config) -> logging.Logger:
     return log
 
 
-def snapshot(cfg: Config) -> list[ConnRecord]:
+def snapshot(cfg: Config, domain_cache: DomainCache | None = None) -> list[ConnRecord]:
     records: list[ConnRecord] = []
     now = datetime.now()
 
@@ -97,6 +129,10 @@ def snapshot(cfg: Config) -> list[ConnRecord]:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 proc_name = "unknown"
 
+        domain: str | None = None
+        if domain_cache is not None:
+            domain = domain_cache.get_or_resolve(remote_ip)
+
         records.append(ConnRecord(
             pid=pid,
             proc_name=proc_name,
@@ -104,6 +140,7 @@ def snapshot(cfg: Config) -> list[ConnRecord]:
             raddr=(conn.raddr.ip, conn.raddr.port),
             status=conn.status,
             first_seen=now,
+            domain=domain,
         ))
 
     return records
@@ -135,7 +172,7 @@ def detect_exits(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="netmon")
+    parser = argparse.ArgumentParser(prog="netmon", description="vigil — host-based AI-threat detector")
     parser.add_argument("--train", metavar="SECONDS", nargs="?", const=3600, type=int,
         help="Run baseline training for N seconds (default 3600), write baseline.json, exit")
     parser.add_argument("--baseline", metavar="PATH", type=Path, default=None)
@@ -165,61 +202,140 @@ def run_training(duration_secs: int, baseline_path: Path, cfg: Config, log: logg
     log.info("training complete: %d polls, %d processes → %s", bl.total_polls, len(bl.processes), baseline_path)
 
 
-def run_poll(state: DaemonState, cfg: Config, log: logging.Logger, baseline: Baseline | None = None) -> None:
-    # 1. snapshot
-    curr_conns = snapshot(cfg)
+def run_poll(
+    state: DaemonState,
+    cfg: Config,
+    log: logging.Logger,
+    baseline: Baseline | None = None,
+    domain_cache: DomainCache | None = None,
+) -> None:
+    # 1. refresh domain cache
+    if domain_cache is not None:
+        domain_cache.refresh()
 
-    # 2. current pids with outbound connections
+    # 2. snapshot
+    curr_conns = snapshot(cfg, domain_cache)
+
+    # 3. current pids with outbound connections
     curr_pids = {c.pid for c in curr_conns}
 
-    # 3. detect exits
+    # 4. detect exits
     state.exited_queue = detect_exits(state.prev_pids, curr_pids, state.active_outbound)
 
-    # 4. update active_outbound — preserve first_seen for existing pids
+    # 5. evict exited PIDs from all alerted sets to handle PID reuse
+    for exit_rec in state.exited_queue:
+        evict_pid(
+            exit_rec.pid,
+            state.ioc_alerted,
+            state.exfil_alerted,
+            state.short_lived_alerted,
+            state.oauth_contact_alerted,
+            state.oauth_chain_alerted,
+            state.oauth_chain_state,
+            state.mcp_traffic_alerted,
+        )
+
+    # 6. update active_outbound — preserve first_seen for existing pids
     for c in curr_conns:
         if c.pid not in state.active_outbound:
             state.active_outbound[c.pid] = c
     for gone in state.exited_queue:
         state.active_outbound.pop(gone.pid, None)
 
-    # 5. push current proc names into rolling history (maxlen enforced by deque)
+    # 7. push current proc names into rolling history (maxlen enforced by deque)
     current_names = {c.proc_name for c in curr_conns}
     state.egress_name_history.append(current_names)
 
-    # 6. known egress = union of all history windows except the current poll
+    # 8. known egress = union of all history windows except the current poll
     history_without_current = list(state.egress_name_history)[:-1]
     known_egress: set[str] = set().union(*history_without_current) if history_without_current else set()
 
-    # 7. advance poll counter; alerting is suppressed during warmup
+    # 9. advance poll counter; alerting is suppressed during warmup
     state.poll_count += 1
     alerting_active = state.poll_count > cfg.warmup_polls
 
-    # 8. run all checks and dispatch
+    # 10. run all checks
     ioc_alerts = check_ioc_ip(curr_conns, cfg.ioc_ips, state.ioc_alerted)
     exfil_alerts = check_parallel_exfil(curr_conns, cfg.parallel_exfil_threshold, state.exfil_alerted)
     egress_alerts = check_new_process_egress(curr_conns, known_egress, cfg.egress_allowlist)
     short_lived_alerts = check_short_lived_egress(
-        state.exited_queue, cfg.short_lived_threshold, state.short_lived_alerted
+        state.exited_queue,
+        cfg.short_lived_threshold,
+        state.short_lived_alerted,
+        egress_allowlist=cfg.egress_allowlist,
+    )
+    oauth_contact_alerts = check_oauth_provider_contact(
+        curr_conns,
+        cfg.oauth_provider_domains,
+        cfg.oauth_browser_procs,
+        state.oauth_contact_alerted,
+        browser_paths=cfg.oauth_browser_paths,
+    )
+    oauth_chain_alerts = check_oauth_provider_chain(
+        curr_conns,
+        cfg.oauth_provider_domains,
+        cfg.oauth_browser_procs,
+        cfg.oauth_chain_window_secs,
+        cfg.oauth_chain_threshold,
+        state.oauth_chain_state,
+        state.oauth_chain_alerted,
+        browser_paths=cfg.oauth_browser_paths,
+    )
+    mcp_alerts = check_mcp_connector_traffic(
+        curr_conns,
+        cfg.mcp_endpoint_host_patterns,
+        cfg.oauth_browser_procs,
+        state.mcp_traffic_alerted,
+        browser_paths=cfg.oauth_browser_paths,
     )
 
     if baseline is not None:
         bl_proc_alerts   = check_baseline_unknown_process(curr_conns, baseline, known_egress, cfg.egress_allowlist, state.baseline_proc_alerted)
-        bl_ip_alerts     = check_baseline_ip_deviation(curr_conns, baseline, cfg.baseline_suppress_cdn_threshold, state.baseline_ip_alerted)
+        bl_ip_alerts     = check_baseline_ip_deviation(
+            curr_conns,
+            baseline,
+            cfg.baseline_suppress_cdn_threshold,
+            state.baseline_ip_alerted,
+            egress_allowlist=cfg.egress_allowlist,
+            ip_allowlist=cfg.egress_ip_allowlist,
+        )
         bl_port_alerts   = check_baseline_port_deviation(curr_conns, baseline, state.baseline_port_alerted)
-        bl_volume_alerts = check_baseline_volume_spike(curr_conns, baseline)
+        bl_volume_alerts = check_baseline_volume_spike(
+            curr_conns, baseline, egress_allowlist=cfg.egress_allowlist,
+        )
         egress_alerts    = []   # suppress old rule when baseline loaded
     else:
         bl_proc_alerts = bl_ip_alerts = bl_port_alerts = bl_volume_alerts = []
 
+    # 11. dispatch and defend
     if alerting_active:
-        for alert in (*ioc_alerts, *exfil_alerts, *egress_alerts, *bl_proc_alerts, *bl_ip_alerts, *bl_port_alerts, *bl_volume_alerts, *short_lived_alerts):
+        all_alerts = (
+            *ioc_alerts,
+            *exfil_alerts,
+            *egress_alerts,
+            *oauth_contact_alerts,
+            *oauth_chain_alerts,
+            *mcp_alerts,
+            *bl_proc_alerts,
+            *bl_ip_alerts,
+            *bl_port_alerts,
+            *bl_volume_alerts,
+            *short_lived_alerts,
+        )
+        for alert in all_alerts:
             dispatch(alert, cfg, log)
+            defend(alert, cfg, log)
     else:
-        total = len(ioc_alerts) + len(exfil_alerts) + len(egress_alerts) + len(short_lived_alerts) + len(bl_proc_alerts) + len(bl_ip_alerts) + len(bl_port_alerts) + len(bl_volume_alerts)
+        total = sum(len(x) for x in (
+            ioc_alerts, exfil_alerts, egress_alerts,
+            oauth_contact_alerts, oauth_chain_alerts, mcp_alerts,
+            bl_proc_alerts, bl_ip_alerts, bl_port_alerts, bl_volume_alerts,
+            short_lived_alerts,
+        ))
         if total:
             log.debug("warmup poll %d: suppressed %d alert(s)", state.poll_count, total)
 
-    # 9. update prev_pids
+    # 12. update prev_pids
     state.prev_pids = curr_pids
 
 
@@ -246,13 +362,19 @@ def main() -> None:
     else:
         log.info("no baseline — running without baseline rules")
 
-    # existing state init and loop — pass baseline to run_poll
+    domain_cache = DomainCache(
+        ttl_secs=30,
+        enable_reverse=cfg.dns_reverse_lookup_enabled,
+        oauth_domains=tuple(cfg.oauth_provider_domains),
+        mcp_patterns=cfg.mcp_endpoint_host_patterns,
+    )
+
     state = DaemonState()
     state.egress_name_history = deque(maxlen=cfg.new_process_lookback)
-    log.info("netmon starting — poll_interval=%ds warmup_polls=%d", cfg.poll_interval, cfg.warmup_polls)
+    log.info("vigil starting — poll_interval=%ds warmup_polls=%d", cfg.poll_interval, cfg.warmup_polls)
     while True:
         try:
-            run_poll(state, cfg, log, baseline)
+            run_poll(state, cfg, log, baseline, domain_cache)
         except Exception as exc:
             log.error("poll error: %s", exc, exc_info=True)
         time.sleep(cfg.poll_interval)
