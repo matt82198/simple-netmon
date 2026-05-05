@@ -1,9 +1,35 @@
+# Runtime artifacts — never commit these
+config.env
+baseline.json
+netmon.log
+restart-watcher.log
+
+# Internal IR / analysis docs — must stay private
+analysis/
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
-*.log
-config.env
-baseline.json
+*.pyd
 *.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
 .venv/
 venv/
+env/
+.env/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor/OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
