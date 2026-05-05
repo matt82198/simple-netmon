@@ -1,0 +1,68 @@
+name: Bug Report
+description: Report a bug in vigil
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a bug. Please provide detailed information to help us investigate.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Brief description of the bug
+      placeholder: What happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Your system and vigil configuration
+      value: |
+        - **OS**:
+        - **Python version**:
+        - **vigil version**:
+        - **Mode**: daemon / train / standalone
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Exact steps to reproduce the bug
+      placeholder: |
+        1. Run vigil with...
+        2. Then...
+        3. Bug occurs when...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs. Actual
+      description: What should happen vs. what actually happens
+      value: |
+        **Expected:**
+
+        **Actual:**
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs
+      description: Paste error logs or debug output (sanitize IPs, hostnames, PIDs if sensitive)
+      render: bash
+      placeholder: "```\nERROR: ...\n```"
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Anything else that might help

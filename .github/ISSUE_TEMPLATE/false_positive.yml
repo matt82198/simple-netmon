@@ -1,0 +1,60 @@
+name: False Positive Report
+description: Report a false positive alert from vigil
+labels: ["false-positive", "credibility", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        False positives undermine detector credibility. Thank you for reporting—we prioritize refinement to reduce noise.
+
+  - type: textarea
+    id: rule_fired
+    attributes:
+      label: Rule That Fired
+      description: Which vigil rule or detection triggered? Include rule ID if available.
+      placeholder: "Rule: OAUTH_PROVIDER_CONTACT or BASELINE_IP_DEVIATION"
+    validations:
+      required: true
+
+  - type: textarea
+    id: process_info
+    attributes:
+      label: Process That Triggered Alert
+      description: Process name, parent, and command line (sanitize PIDs, full paths if sensitive)
+      value: |
+        - **Process**:
+        - **Parent**:
+        - **Command line**:
+        - **User context**:
+        - **Binary hash (SHA256)**:
+    validations:
+      required: true
+
+  - type: textarea
+    id: why_false_positive
+    attributes:
+      label: Why This Is a False Positive
+      description: Explain the legitimate purpose and why the rule should not have triggered
+      placeholder: "This is [legitimate service/app], which [normal activity]. The rule fired because..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: rule_refinement
+    attributes:
+      label: Suggested Rule Refinement
+      description: How should the rule be updated to avoid this in the future?
+      placeholder: "Add to allowlist, add exemption for [user context], or adjust threshold..."
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Alert Log
+      description: Paste the full vigil alert or log entry (sanitize sensitive data)
+      render: yaml
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: OS, vigil version, mode (daemon/train), frequency of alert

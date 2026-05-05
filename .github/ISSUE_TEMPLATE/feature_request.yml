@@ -1,0 +1,52 @@
+name: Feature Request
+description: Propose a new feature or enhancement for vigil
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for suggesting a feature. Help us understand how this advances vigil's core mission.
+
+  - type: dropdown
+    id: pillar
+    attributes:
+      label: Which pillar does this advance?
+      description: Select the primary detection or defense capability this feature serves
+      options:
+        - C2 Detection (command & control exfiltration)
+        - Real-Time Defense (proactive mitigation)
+        - Identity Monitoring (OAuth abuse, token chaining)
+        - AI Behavior Analysis (anomaly detection, LLM pivots)
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: What gap or pain point does this address?
+      placeholder: "Vigil currently cannot... which means..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: How should vigil solve this? Be specific about behavior, output, or detection logic.
+      placeholder: "vigil should..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: What other approaches did you consider, and why is your solution better?
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Links, examples, threat models, or references
